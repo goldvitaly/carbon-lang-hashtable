@@ -14,11 +14,11 @@
 #include <type_traits>
 #include <utility>
 
-#include "common/check.h"
-#include "common/hashing.h"
-#include "common/raw_hashtable_metadata_group.h"
-#include "llvm/Support/Compiler.h"
-#include "llvm/Support/MathExtras.h"
+#include "third_party/carbon/lang/common/check.h"
+#include "third_party/carbon/lang/common/hashing.h"
+#include "third_party/carbon/lang/common/raw_hashtable_metadata_group.h"
+#include "third_party/llvm/llvm-project/llvm/include/llvm/Support/Compiler.h"
+#include "third_party/llvm/llvm-project/llvm/include/llvm/Support/MathExtras.h"
 
 // A namespace collecting a set of low-level utilities for building hashtable
 // data structures. These should only be used as implementation details of
@@ -573,6 +573,7 @@ class BaseImpl {
   template <typename LookupKeyT>
   auto InsertIntoEmpty(LookupKeyT lookup_key, KeyContextT key_context)
       -> EntryT*;
+  auto InsertIntoEmpty(HashCode hash) -> EntryT*;
 
   static auto ComputeNextAllocSize(ssize_t old_alloc_size) -> ssize_t;
   static auto GrowthThresholdForAllocSize(ssize_t alloc_size) -> ssize_t;
@@ -1291,11 +1292,8 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::MoveFrom(
 // these are true, typically just after growth, we can dramatically simplify the
 // insert position search.
 template <typename InputKeyT, typename InputValueT, typename InputKeyContextT>
-template <typename LookupKeyT>
-[[clang::noinline]] auto
-BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::InsertIntoEmpty(
-    LookupKeyT lookup_key, KeyContextT key_context) -> EntryT* {
-  HashCode hash = key_context.HashKey(lookup_key, ComputeSeed());
+auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::InsertIntoEmpty(
+    HashCode hash) -> EntryT* {
   auto [hash_index, tag] = hash.ExtractIndexAndTag<7>();
   uint8_t* local_metadata = metadata();
   EntryT* local_entries = entries();
@@ -1312,6 +1310,13 @@ BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::InsertIntoEmpty(
 
     // Otherwise we continue probing.
   }
+}
+template <typename InputKeyT, typename InputValueT, typename InputKeyContextT>
+template <typename LookupKeyT>
+[[clang::noinline]] auto
+BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::InsertIntoEmpty(
+    LookupKeyT lookup_key, KeyContextT key_context) -> EntryT* {
+  return InsertIntoEmpty(key_context.HashKey(lookup_key, ComputeSeed()));
 }
 
 // Apply our doubling growth strategy and (re-)check invariants around table
@@ -1375,7 +1380,7 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::GrowToNextAllocSize(
   // the group walk rather than after the group walk. In practice, between the
   // statistical rareness and using a large small size buffer here on the stack,
   // we can handle this most efficiently with temporary, additional storage.
-  llvm::SmallVector<ssize_t, 128> probed_indices;
+  llvm::SmallVector<std::pair<ssize_t, HashCode>, 128> probed_indices;
 
   // Create locals for the old state of the table.
   ssize_t old_size = alloc_size();
@@ -1449,7 +1454,7 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::GrowToNextAllocSize(
       ssize_t old_hash_index = hash.ExtractIndexAndTag<7>().first &
                                ComputeProbeMaskFromSize(old_size);
       if (LLVM_UNLIKELY(old_hash_index != group_index)) {
-        probed_indices.push_back(old_index);
+        probed_indices.emplace_back(old_index, hash);
         if constexpr (MetadataGroup::FastByteClear) {
           low_g.ClearByte(byte_index);
           high_g.ClearByte(byte_index);
@@ -1510,9 +1515,8 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::GrowToNextAllocSize(
 
   // We then need to do a normal insertion for anything that was probed before
   // growth, but we know we'll find an empty slot, so leverage that.
-  for (ssize_t old_index : probed_indices) {
-    EntryT* new_entry =
-        InsertIntoEmpty(old_entries[old_index].key(), key_context);
+  for (auto [old_index, hash] : probed_indices) {
+    EntryT* new_entry = InsertIntoEmpty(hash);
     new_entry->MoveFrom(std::move(old_entries[old_index]));
   }
   CARBON_DCHECK(count ==
