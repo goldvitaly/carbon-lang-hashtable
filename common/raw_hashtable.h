@@ -14,11 +14,11 @@
 #include <type_traits>
 #include <utility>
 
-#include "third_party/carbon/lang/common/check.h"
-#include "third_party/carbon/lang/common/hashing.h"
-#include "third_party/carbon/lang/common/raw_hashtable_metadata_group.h"
-#include "third_party/llvm/llvm-project/llvm/include/llvm/Support/Compiler.h"
-#include "third_party/llvm/llvm-project/llvm/include/llvm/Support/MathExtras.h"
+#include "common/check.h"
+#include "common/hashing.h"
+#include "common/raw_hashtable_metadata_group.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/MathExtras.h"
 
 // A namespace collecting a set of low-level utilities for building hashtable
 // data structures. These should only be used as implementation details of
