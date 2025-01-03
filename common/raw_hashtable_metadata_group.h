@@ -372,8 +372,7 @@ class MetadataGroup : public Printable<MetadataGroup> {
   // already-loaded value when clearing bytes. But when we have a larger group
   // size, clearing the byte will typically require storing a byte to memory and
   // re-loading the group. The usage patterns that need to set bytes can in
-  // those cases avoid clearing a loaded group, and clear the byte directly in
-  // the larger metadata array.
+  // those cases can do it directly in the larger metadata array.
   // Worth mentioning that in our benchmarks, on the x86 setting byte directly
   // to the memory is actually faster than setting the byte in the register.
   static constexpr bool FastByteSet = Size == 8;
