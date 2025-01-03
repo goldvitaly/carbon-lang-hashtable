@@ -1418,9 +1418,9 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::GrowToNextAllocSize(
     // Make sure to match present elements first to enable pipelining with
     // clearing.
     auto present_matched_range = low_g.MatchPresent();
-    low_g.ClearDeleted();
+    low_g.SetToEmpty();
     MetadataGroup high_g;
-    if constexpr (MetadataGroup::FastByteClear) {
+    if constexpr (MetadataGroup::FastByteSet) {
       // When we have a fast byte clear, we can update the metadata for the
       // growth in-register and store at the end.
       high_g = low_g;
@@ -1430,42 +1430,37 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::GrowToNextAllocSize(
       // clearing the byte in-register.
       low_g.Store(new_metadata, group_index);
       low_g.Store(new_metadata, group_index | old_size);
+      CARBON_DCHECK(new_metadata[group_index] == MetadataGroup::Empty);
+      CARBON_DCHECK(new_metadata[group_index | old_size] ==
+                    MetadataGroup::Empty);
     }
     for (ssize_t byte_index : present_matched_range) {
+      CARBON_DCHECK(old_metadata[group_index + byte_index] !=
+                    MetadataGroup::Empty);
+      CARBON_DCHECK(old_metadata[group_index + byte_index] !=
+                    MetadataGroup::Deleted);
       ++count;
       ssize_t old_index = group_index + byte_index;
-      if constexpr (!MetadataGroup::FastByteClear) {
-        CARBON_DCHECK(new_metadata[old_index] == old_metadata[old_index]);
-        CARBON_DCHECK(new_metadata[old_index | old_size] ==
-                      old_metadata[old_index]);
-      }
       HashCode hash =
           key_context.HashKey(old_entries[old_index].key(), ComputeSeed());
-      ssize_t old_hash_index = hash.ExtractIndexAndTag<7>().first &
-                               ComputeProbeMaskFromSize(old_size);
+      auto [hash_index, tag] = hash.ExtractIndexAndTag<7>();
+      ssize_t old_hash_index = hash_index & ComputeProbeMaskFromSize(old_size);
       if (LLVM_UNLIKELY(old_hash_index != group_index)) {
         probed_indices.push_back({old_index, hash});
-        if constexpr (MetadataGroup::FastByteClear) {
-          low_g.ClearByte(byte_index);
-          high_g.ClearByte(byte_index);
-        } else {
-          new_metadata[old_index] = MetadataGroup::Empty;
-          new_metadata[old_index | old_size] = MetadataGroup::Empty;
-        }
         continue;
       }
-      ssize_t new_index = hash.ExtractIndexAndTag<7>().first &
-                          ComputeProbeMaskFromSize(new_size);
+      ssize_t new_index = hash_index & ComputeProbeMaskFromSize(new_size);
       CARBON_DCHECK(new_index == old_hash_index ||
                     new_index == (old_hash_index | old_size));
       // Toggle the newly added bit of the index to get to the other possible
       // target index.
-      if constexpr (MetadataGroup::FastByteClear) {
-        (new_index == old_hash_index ? high_g : low_g).ClearByte(byte_index);
+      if constexpr (MetadataGroup::FastByteSet) {
+        (new_index == old_hash_index ? low_g : high_g)
+            .OverwriteEmptyByte(byte_index, tag | MetadataGroup::PresentMask);
         new_index += byte_index;
       } else {
         new_index += byte_index;
-        new_metadata[new_index ^ old_size] = MetadataGroup::Empty;
+        new_metadata[new_index] = tag | MetadataGroup::PresentMask;
       }
 
       // If we need to explicitly move (and destroy) the key or value, do so
@@ -1474,7 +1469,7 @@ auto BaseImpl<InputKeyT, InputValueT, InputKeyContextT>::GrowToNextAllocSize(
         new_entries[new_index].MoveFrom(std::move(old_entries[old_index]));
       }
     }
-    if constexpr (MetadataGroup::FastByteClear) {
+    if constexpr (MetadataGroup::FastByteSet) {
       low_g.Store(new_metadata, group_index);
       high_g.Store(new_metadata, (group_index | old_size));
     }

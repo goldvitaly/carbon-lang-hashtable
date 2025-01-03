@@ -27,8 +27,6 @@ class BenchmarkPortableMetadataGroup : public MetadataGroup {
     PortableStore(metadata, index);
   }
 
-  auto ClearDeleted() -> void { PortableClearDeleted(); }
-
   auto Match(uint8_t present_byte) const -> PortableMatchRange {
     return PortableMatch(present_byte);
   }
@@ -52,8 +50,6 @@ class BenchmarkSIMDMetadataGroup : public MetadataGroup {
   auto Store(uint8_t* metadata, ssize_t index) const -> void {
     SIMDStore(metadata, index);
   }
-
-  auto ClearDeleted() -> void { SIMDClearDeleted(); }
 
   auto Match(uint8_t present_byte) const -> SIMDMatchRange {
     return SIMDMatch(present_byte);

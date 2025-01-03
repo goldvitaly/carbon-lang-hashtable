@@ -6,6 +6,7 @@
 #define CARBON_COMMON_RAW_HASHTABLE_METADATA_GROUP_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <type_traits>
@@ -25,6 +26,7 @@
 // - https://arm-software.github.io/acle/neon_intrinsics/advsimd.html
 // - https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html
 #if defined(__SSSE3__)
+#include <emmintrin.h>
 #include <x86intrin.h>
 #define CARBON_X86_SIMD_SUPPORT 1
 #elif defined(__ARM_NEON)
@@ -369,10 +371,12 @@ class MetadataGroup : public Printable<MetadataGroup> {
   // register, this works well and clients of the group should work to use the
   // already-loaded value when clearing bytes. But when we have a larger group
   // size, clearing the byte will typically require storing a byte to memory and
-  // re-loading the group. The usage patterns that need to clear bytes can in
+  // re-loading the group. The usage patterns that need to set bytes can in
   // those cases avoid clearing a loaded group, and clear the byte directly in
   // the larger metadata array.
-  static constexpr bool FastByteClear = Size == 8;
+  // Worth mentioning that in our benchmarks, on the x86 setting byte directly
+  // to the memory is actually faster than setting the byte in the register.
+  static constexpr bool FastByteSet = Size == 8;
 
   // Most and least significant bits set.
   static constexpr uint64_t MSBs = 0x8080'8080'8080'8080ULL;
@@ -432,20 +436,19 @@ class MetadataGroup : public Printable<MetadataGroup> {
   // `index`. The index must be a multiple of `GroupSize`.
   auto Store(uint8_t* metadata, ssize_t index) const -> void;
 
-  // Clear a byte of this group's metadata at the provided `byte_index` to the
-  // empty value.
+  // Overwrite an *empty* byte of this group's metadata at the provided
+  // `byte_index`.
   //
-  // Note that this must only be called when `FastByteClear` is true -- in all
-  // other cases users of this class should arrange to clear individual bytes in
+  // Note that this must only be called when `FastByteSet` is true -- in all
+  // other cases users of this class should arrange to set individual bytes in
   // the underlying array rather than using the group API. This is checked by a
   // static_assert, and the function is templated so that it is not instantiated
   // in the cases where it would not be valid.
   template <bool IsCalled = true>
-  auto ClearByte(ssize_t byte_index) -> void;
+  auto OverwriteEmptyByte(ssize_t byte_index, uint8_t tag) -> void;
 
-  // Clear all of this group's metadata bytes that indicate a deleted slot to
-  // the empty value.
-  auto ClearDeleted() -> void;
+  // Set all control bytes in this group to the empty value.
+  auto SetToEmpty() -> void;
 
   // Find all of the bytes of metadata in this group that are present and whose
   // low 7 bits match the provided `tag`. The `tag` byte must have a clear high
@@ -534,7 +537,7 @@ class MetadataGroup : public Printable<MetadataGroup> {
       -> MetadataGroup;
   auto PortableStore(uint8_t* metadata, ssize_t index) const -> void;
 
-  auto PortableClearDeleted() -> void;
+  auto PortableSetToEmpty() -> void;
 
   auto PortableMatch(uint8_t tag) const -> PortableMatchRange;
   auto PortableMatchPresent() const -> PortableMatchRange;
@@ -556,7 +559,7 @@ class MetadataGroup : public Printable<MetadataGroup> {
   static auto SIMDLoad(const uint8_t* metadata, ssize_t index) -> MetadataGroup;
   auto SIMDStore(uint8_t* metadata, ssize_t index) const -> void;
 
-  auto SIMDClearDeleted() -> void;
+  auto SIMDSetToEmpty() -> void;
 
   auto SIMDMatch(uint8_t tag) const -> SIMDMatchRange;
   auto SIMDMatchPresent() const -> SIMDMatchPresentRange;
@@ -603,27 +606,28 @@ inline auto MetadataGroup::Store(uint8_t* metadata, ssize_t index) const
 }
 
 template <bool IsCalled>
-inline auto MetadataGroup::ClearByte(ssize_t byte_index) -> void {
-  static_assert(!IsCalled || FastByteClear,
-                "Only use byte clearing when fast!");
-  static_assert(!IsCalled || Size == 8,
-                "The clear implementation assumes an 8-byte group.");
-
-  metadata_ints[0] &= ~(static_cast<uint64_t>(0xff) << (byte_index * 8));
+inline auto MetadataGroup::OverwriteEmptyByte(ssize_t byte_index, uint8_t tag)
+    -> void {
+  static_assert(!IsCalled || FastByteSet, "Only use setting a byte when fast!");
+  static_assert(
+      !IsCalled || Size == 8,
+      "The OverwriteEmptyByte implementation assumes an 8-byte group.");
+  CARBON_DCHECK(metadata_bytes[byte_index] == 0);
+  metadata_ints[0] |= (static_cast<uint64_t>(tag) << (byte_index * 8));
 }
 
-inline auto MetadataGroup::ClearDeleted() -> void {
+inline auto MetadataGroup::SetToEmpty() -> void {
   MetadataGroup portable_g = *this;
   MetadataGroup simd_g = *this;
   if constexpr (!UseSIMD || DebugSIMD) {
-    portable_g.PortableClearDeleted();
+    portable_g.PortableSetToEmpty();
   }
   if constexpr (UseSIMD || DebugSIMD) {
-    simd_g.SIMDClearDeleted();
-    CARBON_DCHECK(
-        simd_g == portable_g,
-        "SIMD cleared group '{0}' doesn't match portable cleared group '{1}'",
-        simd_g, portable_g);
+    simd_g.SIMDSetToEmpty();
+    CARBON_DCHECK(simd_g == portable_g,
+                  "SIMD set to empty group '{0}' doesn't match portable set to "
+                  "empty group '{1}'",
+                  simd_g, portable_g);
   }
   *this = UseSIMD ? simd_g : portable_g;
 }
@@ -790,19 +794,8 @@ inline auto MetadataGroup::PortableStore(uint8_t* metadata, ssize_t index) const
   std::memcpy(metadata + index, &metadata_bytes, Size);
 }
 
-inline auto MetadataGroup::PortableClearDeleted() -> void {
-  for (uint64_t& metadata_int : metadata_ints) {
-    // Deleted bytes have only the least significant bits set, so to clear them
-    // we only need to clear the least significant bit. And empty bytes already
-    // have a clear least significant bit, so the only least significant bits we
-    // need to preserve are those of present bytes. The most significant bit of
-    // every present byte is set, so we take the most significant bit of each
-    // byte, shift it into the least significant bit position, and bit-or it
-    // with the compliment of `LSBs`. This will have ones for every bit but the
-    // least significant bits, and ones for the least significant bits of every
-    // present byte.
-    metadata_int &= (~LSBs | metadata_int >> 7);
-  }
+inline auto MetadataGroup::PortableSetToEmpty() -> void {
+  std::memset(&metadata_bytes, MetadataGroup::Empty, Size);
 }
 
 inline auto MetadataGroup::PortableMatch(uint8_t tag) const -> MatchRange {
@@ -1014,19 +1007,11 @@ inline auto MetadataGroup::SIMDStore(uint8_t* metadata, ssize_t index) const
 #endif
 }
 
-inline auto MetadataGroup::SIMDClearDeleted() -> void {
+inline auto MetadataGroup::SIMDSetToEmpty() -> void {
 #if CARBON_NEON_SIMD_SUPPORT
-  // There is no good Neon operation to implement this, so do it using integer
-  // code. This is reasonably fast, but unfortunate because it forces the group
-  // out of a SIMD register and into a general purpose register, which can have
-  // high latency.
-  metadata_ints[0] &= (~LSBs | metadata_ints[0] >> 7);
+  metadata_ints[0] = 0;
 #elif CARBON_X86_SIMD_SUPPORT
-  // For each byte, use `metadata_vec` if the byte's high bit is set (indicating
-  // it is present), otherwise (it is empty or deleted) replace it with zero
-  // (representing empty).
-  metadata_vec =
-      _mm_blendv_epi8(_mm_setzero_si128(), metadata_vec, metadata_vec);
+  metadata_vec = _mm_setzero_si128();
 #else
   static_assert(!UseSIMD && !DebugSIMD, "Unimplemented SIMD operation");
 #endif
